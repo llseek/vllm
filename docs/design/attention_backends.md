@@ -153,6 +153,12 @@ Priority is **1 = highest** (tried first).
 
 ## Legend
 
+For models with learnable attention sinks, FlashAttention supports decode
+context parallelism (DCP) on sink-capable kernels. Enable it with
+`--decode-context-parallel-size` greater than 1 (the default is 1).
+The cached-context shards are combined without a sink; the new-token
+attention state includes the sink once before the final merge.
+
 | Column | Description |
 | ------ | ----------- |
 | **Dtypes** | Supported model data types (fp16, bf16, fp32) |
