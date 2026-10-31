@@ -16,14 +16,17 @@ The subclass intentionally keeps the inherited ``get_name()``
 (``"FLASHMLA_SPARSE"``). Several shared code paths key off that exact string —
 `_canonicalize_sparse_mla_kv_cache_dtype` promotes a quantized KV cache to
 ``fp8_ds_mla`` for it, and `FlashMLASparseImpl` asserts that layout — so a new
-name would silently change KV cache behaviour. Only``supports_sink`` and the
-two kernel wrappers differ from the parent.
+name would silently change KV cache behaviour. Sink preparation and the
+kernel wrappers remain local to this model.
 """
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.config import get_current_vllm_config
+from vllm.distributed import get_dcp_group, get_tp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
@@ -38,6 +41,7 @@ from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.deepseek_v2 import Indexer
+    from vllm.v1.attention.backend import AttentionLayer
 
 logger = init_logger(__name__)
 
@@ -88,6 +92,28 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         )
         self._validate_sinks(sinks, num_heads)
         self.sinks = sinks
+        self._query_sinks = sinks
+        self._sharded_sinks: torch.Tensor | None = None
+
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        super().process_weights_after_loading(act_dtype)
+        self._query_sinks = self.sinks
+        self._sharded_sinks = None
+        if self.sinks is None or self.dcp_world_size == 1:
+            return
+
+        pcp_size = (
+            get_current_vllm_config().parallel_config.prefill_context_parallel_size
+        )
+        query_sinks = self.sinks
+        # Match MLAAttention's query-head gather, including the PCP layout.
+        if pcp_size == 1:
+            query_sinks = get_dcp_group().all_gather(self.sinks, dim=0)
+        elif self.dcp_world_size > pcp_size:
+            query_sinks = get_tp_group().all_gather(self.sinks, dim=0)
+        self._query_sinks = query_sinks
+        # Each KV shard contributes an equal fraction of the virtual sink.
+        self._sharded_sinks = query_sinks - math.log(self.dcp_world_size)
 
     @staticmethod
     def _validate_sinks(sinks: torch.Tensor | None, num_heads: int) -> None:
@@ -120,6 +146,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         q: torch.Tensor,
         head_dim: int,
         kernel_heads: int,
+        sharded_kv: bool = False,
     ) -> torch.Tensor | None:
         """Return the sink laid out for the kernel's query head count.
 
@@ -128,6 +155,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             head_dim: Axis of ``q`` holding the query heads.
             kernel_heads: Head count the kernel is invoked with, which may
                 exceed the query head count because of padding.
+            sharded_kv: Whether the kernel attends a DCP-local KV shard.
 
         Returns:
             The sink tensor padded to ``kernel_heads`` with ``-inf`` (a no-op
@@ -138,7 +166,7 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
                 live on different devices.
 
         """
-        sinks = self.sinks
+        sinks = self._sharded_sinks if sharded_kv else self._query_sinks
         if sinks is None:
             return None
 
@@ -182,7 +210,12 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
         # q shape: (batch, seq_len, num_heads, head_dim)
         actual_num_heads = q.size(2)
         padded_num_heads = self.fp8_decode_padded_heads
-        attn_sink = self._sinks_for_query(q, head_dim=2, kernel_heads=padded_num_heads)
+        attn_sink = self._sinks_for_query(
+            q,
+            head_dim=2,
+            kernel_heads=padded_num_heads,
+            sharded_kv=self.dcp_world_size > 1,
+        )
 
         # Pad query if needed (kernel only supports h_q = 64 or 128)
         if actual_num_heads < padded_num_heads:
@@ -212,6 +245,20 @@ class HYV4FlashMLASparseImpl(FlashMLASparseImpl):
             out = out[:, :, :actual_num_heads, :]
             lse = lse[:, :actual_num_heads, :]
 
+        return out, lse
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        layer: "AttentionLayer",
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        out, lse = super().forward_mqa(q, kv_c_and_k_pe_cache, attn_metadata, layer)
+        if lse is not None and self._sharded_sinks is not None:
+            # FlashMLA returns sink-free LSE. Add the sink after the parent's
+            # empty-row masking so even an empty KV shard retains its share.
+            lse = torch.logaddexp(lse, self._sharded_sinks[None, :])
         return out, lse
 
     def _bf16_flash_mla_kernel(
