@@ -96,3 +96,20 @@ steps:
       - VLLM_ROCM_USE_AITER=1 pytest -v -s models/test_hyv4_rocm.py -m 'distributed(num_gpus=2)'
       - pytest models/multimodal -v -s -m 'distributed(num_gpus=2)' --ignore models/multimodal/generation/test_whisper.py
       - VLLM_WORKER_MULTIPROC_METHOD=spawn pytest models/multimodal/generation/test_whisper.py -v -s -m 'distributed(num_gpus=2)'
+
+- label: ":nvidia: (H100) HY4 DCP sinks"
+  key: hy4-dcp-sinks-2-gpus
+  depends_on:
+  - image-build
+  timeout_in_minutes: 20
+  working_dir: "/vllm-workspace/tests"
+  device: h100
+  num_devices: 2
+  source_file_dependencies:
+  - vllm/models/hy_v4/
+  - vllm/model_executor/layers/attention/mla_attention.py
+  - vllm/v1/attention/backends/mla/flashmla_sparse.py
+  - vllm/v1/attention/ops/dcp.py
+  - tests/models/hy_v4/test_dcp.py
+  commands:
+  - VLLM_WORKER_MULTIPROC_METHOD=spawn pytest -v -s models/hy_v4/test_dcp.py

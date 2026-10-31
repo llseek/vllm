@@ -54,3 +54,15 @@ Decode context parallel is supported in vLLM, for both MLA and GQA models. Some 
 ## Technical Discussions
 
 The main discussions happen in the `#sig-context-parallel` channel of [vLLM Slack](https://slack.vllm.ai/).
+
+### HY4 attention sinks
+
+On NVIDIA GPUs, HY4 supports DCP with `FLASHMLA_SPARSE` and an
+`fp8_ds_mla` KV cache. For example, add `--tensor-parallel-size 8
+--decode-context-parallel-size 2 --attention-backend FLASHMLA_SPARSE
+--kv-cache-dtype fp8_ds_mla` to an HY4 deployment.
+
+HY4's learned attention sinks are retained when the KV cache is sharded.
+Each shard contributes an equal fraction of the sink mass, so the combined
+attention denominator includes the sink once. The BF16 KV-cache sparse path
+does not support DCP.
